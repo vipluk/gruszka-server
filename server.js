@@ -42,6 +42,23 @@ const saveHistory = () => {
 
 const fileOwners = {};
 
+// --- METERED TURN SERVER ---
+const METERED_APP_NAME = "gruszka";
+const METERED_API_KEY = "3z13KRDPzT92C9aWTSOsYNdjlHBOB2Fwy40kRgMWIkLYhprx";
+
+app.get('/api/turn-credentials', async (req, res) => {
+  try {
+    const response = await fetch(
+      `https://${METERED_APP_NAME}.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`
+    );
+    const iceServers = await response.json();
+    res.json(iceServers);
+  } catch (error) {
+    console.error("Błąd pobierania TURN credentials:", error);
+    res.status(500).json({ error: "Nie udało się pobrać TURN credentials" });
+  }
+});
+
 const updateAllRoomStates = () => {
   const roomsData = {};
   const allRooms = Array.from(io.sockets.adapter.rooms.keys());
