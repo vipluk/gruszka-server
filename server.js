@@ -167,6 +167,10 @@ io.on('connection', (socket) => {
     updateAllRoomStates();
   });
 
+  socket.on('ping-server', (cb) => {
+    if (typeof cb === 'function') cb();
+  });
+
   socket.on('disconnect', () => {
     for (const hash in fileOwners) {
       if (fileOwners[hash]) fileOwners[hash].delete(socket.id);
