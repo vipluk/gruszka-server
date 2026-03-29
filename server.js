@@ -12,7 +12,7 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // --- KONFIGURACJA GOOGLE ---
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "864552426279-tuo24v2lft4c6tiqpl63uaj0fo73gkth.apps.googleusercontent.com";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "69113746688-m3bm8hlckp77gqmnmpt58ck68o8s1c3v.apps.googleusercontent.com";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 
@@ -258,12 +258,14 @@ io.on('connection', (socket) => {
 
   // Logowanie przez Google
   socket.on('google-login', async ({ credential, roomId, status, customText }) => {
+    console.log(`[LOGIN] Próba logowania. ID Klienta (serwer): ${GOOGLE_CLIENT_ID.substring(0, 15)}...`);
     try {
       const ticket = await googleClient.verifyIdToken({
         idToken: credential,
         audience: GOOGLE_CLIENT_ID,
       });
       const payload = ticket.getPayload();
+      console.log(`[LOGIN] Sukces: ${payload.name} (${payload.email})`);
 
       users[socket.id].username = payload.name;
       users[socket.id].avatar = payload.picture;
@@ -285,7 +287,9 @@ io.on('connection', (socket) => {
 
       socket.emit('login-success', {
         username: payload.name,
-        avatar: payload.picture
+        avatar: payload.picture,
+        status: users[socket.id].status,
+        customText: users[socket.id].customText
       });
 
       socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
@@ -295,7 +299,8 @@ io.on('connection', (socket) => {
         socket.to(roomId).emit('user-connected', socket.id);
       }
     } catch (e) {
-      console.error("Błąd weryfikacji Google:", e);
+      console.error("[LOGIN] Błąd weryfikacji:", e.message);
+      socket.emit('login-error', { error: "Błąd weryfikacji Google" });
     }
   });
 
