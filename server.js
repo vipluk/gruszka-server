@@ -243,7 +243,8 @@ const updateAllRoomStates = () => {
         avatar: users[id]?.avatar,
         mic: users[id]?.mic || false,
         deaf: users[id]?.deaf || false,
-        status: users[id]?.status || 'online'
+        status: users[id]?.status || 'online',
+        customText: users[id]?.customText || ''
       }))
       .filter(u => u.username != null);
     roomsData[roomId] = usersInRoom;
@@ -256,7 +257,7 @@ io.on('connection', (socket) => {
   users[socket.id] = { username: null, avatar: null, rooms: new Set(), mic: false, deaf: false, status: 'online' };
 
   // Logowanie przez Google
-  socket.on('google-login', async ({ credential, roomId }) => {
+  socket.on('google-login', async ({ credential, roomId, status, customText }) => {
     try {
       const ticket = await googleClient.verifyIdToken({
         idToken: credential,
@@ -266,12 +267,15 @@ io.on('connection', (socket) => {
 
       users[socket.id].username = payload.name;
       users[socket.id].avatar = payload.picture;
-      users[socket.id].status = 'online';
+      users[socket.id].status = status || 'online';
+      if (customText) users[socket.id].customText = customText.substring(0, 32);
 
+      let existing = allSeenUsers[payload.name];
       allSeenUsers[payload.name] = {
         username: payload.name,
         avatar: payload.picture,
-        status: 'online',
+        status: status || (existing ? existing.status : 'online'),
+        customText: customText || (existing ? existing.customText : ''),
         lastSeen: Date.now()
       };
       saveUsers();
@@ -312,15 +316,19 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('update-status', ({ status }) => {
-    if (users[socket.id] && ['online', 'dnd', 'away'].includes(status)) {
+  socket.on('update-status', ({ status, customText }) => {
+    if (users[socket.id] && (['online', 'dnd', 'away'].includes(status) || status === 'offline')) {
       users[socket.id].status = status;
+      if (customText !== undefined) users[socket.id].customText = customText.substring(0, 32);
+
       if (users[socket.id].username) {
-        if (!allSeenUsers[users[socket.id].username]) {
-          allSeenUsers[users[socket.id].username] = { username: users[socket.id].username, avatar: users[socket.id].avatar };
+        const username = users[socket.id].username;
+        if (!allSeenUsers[username]) {
+          allSeenUsers[username] = { username, avatar: users[socket.id].avatar };
         }
-        allSeenUsers[users[socket.id].username].status = status;
-        allSeenUsers[users[socket.id].username].lastSeen = Date.now();
+        allSeenUsers[username].status = status;
+        if (customText !== undefined) allSeenUsers[username].customText = customText.substring(0, 32);
+        allSeenUsers[username].lastSeen = Date.now();
       }
       updateAllRoomStates();
       saveUsers();
