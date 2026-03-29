@@ -238,7 +238,7 @@ const updateAllRoomStates = () => {
 
   // Przygotuj kopię allSeenUsers z nakładką aktualnych statusów ONLINE
   const broadcastUsers = { ...allSeenUsers };
-  Object.values(io.sockets.sockets.values()).forEach(s => {
+  Array.from(io.sockets.sockets.values()).forEach(s => {
     const u = users[s.id];
     if (u && u.username) {
       broadcastUsers[u.username] = {
@@ -311,7 +311,7 @@ io.on('connection', (socket) => {
       socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
       updateAllRoomStates();
 
-      if (roomId) {
+      if (roomId && (roomId.startsWith('voice-') || roomId === 'Lobby')) {
         socket.to(roomId).emit('user-connected', socket.id);
       }
     } catch (e) {
@@ -326,7 +326,9 @@ io.on('connection', (socket) => {
     users[socket.id].rooms.add(roomId);
     socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
     updateAllRoomStates();
-    if (roomId) socket.to(roomId).emit('user-connected', socket.id);
+    if (roomId && (roomId.startsWith('voice-') || roomId === 'Lobby')) {
+      socket.to(roomId).emit('user-connected', socket.id);
+    }
   });
 
   socket.on('update-mute-status', ({ mic, deaf }) => {
