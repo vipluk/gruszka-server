@@ -236,6 +236,22 @@ const updateAllRoomStates = () => {
     .map(s => users[s.id]?.username)
     .filter(u => u != null);
 
+  // Przygotuj kopię allSeenUsers z nakładką aktualnych statusów ONLINE
+  const broadcastUsers = { ...allSeenUsers };
+  Object.values(io.sockets.sockets.values()).forEach(s => {
+    const u = users[s.id];
+    if (u && u.username) {
+      broadcastUsers[u.username] = {
+        ...broadcastUsers[u.username],
+        username: u.username,
+        avatar: u.avatar,
+        status: u.status || 'online',
+        customText: u.customText || '',
+        lastSeen: Date.now()
+      };
+    }
+  });
+
   allRooms.forEach(roomId => {
     const usersInRoom = Array.from(io.sockets.adapter.rooms.get(roomId) || [])
       .map(id => ({
@@ -250,7 +266,7 @@ const updateAllRoomStates = () => {
     roomsData[roomId] = usersInRoom;
   });
 
-  io.emit('global-room-update', { rooms: roomsData, users: allSeenUsers, guilds, onlineUsernames });
+  io.emit('global-room-update', { rooms: roomsData, users: broadcastUsers, guilds, onlineUsernames });
 };
 
 io.on('connection', (socket) => {
