@@ -311,7 +311,7 @@ io.on('connection', (socket) => {
       socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
       updateAllRoomStates();
 
-      if (roomId.startsWith('voice-')) {
+      if (roomId) {
         socket.to(roomId).emit('user-connected', socket.id);
       }
     } catch (e) {
@@ -326,7 +326,7 @@ io.on('connection', (socket) => {
     users[socket.id].rooms.add(roomId);
     socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
     updateAllRoomStates();
-    if (roomId.startsWith('voice-')) socket.to(roomId).emit('user-connected', socket.id);
+    if (roomId) socket.to(roomId).emit('user-connected', socket.id);
   });
 
   socket.on('update-mute-status', ({ mic, deaf }) => {
