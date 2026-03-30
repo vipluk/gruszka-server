@@ -3,3 +3,7 @@ chat-history.json
 guilds.json
 users.json
 .env
+drive-results.txt
+drive-users.json
+test-drive2.js
+test.js
