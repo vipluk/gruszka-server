@@ -2,6 +2,6 @@ I’m slowly building a simple alternative to Discord, whose main features will 
 
 *File size is limited by the user’s Google storage space
 
-![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-01.png)
+![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-1.png)
 ![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-1.png)
 ![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-2.png)
