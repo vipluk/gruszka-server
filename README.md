@@ -5,3 +5,7 @@ I’m slowly building a simple alternative to Discord, whose main features will 
 ![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-0.png)
 ![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-1.png)
 ![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-2.png)
+![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-3.png)
+![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-4.png)
+![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-5.png)
+![Widzisz ten napis w języku Polskim bo obrazek się nie załadował](assets/screenshot-6.png)
