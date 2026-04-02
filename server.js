@@ -943,8 +943,11 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('join-room', ({ roomId, username }) => {
+  socket.on('join-room', ({ roomId }) => {
     // Autoryzacja Gildijna Przed Dołączeniem
+    const user = users[socket.id];
+    const username = user ? user.username : null;
+
     let targetGuildId = null;
     if (guilds[roomId]) targetGuildId = roomId;
     else {
@@ -952,14 +955,9 @@ io.on('connection', (socket) => {
     }
     
     if (targetGuildId && guilds[targetGuildId]) {
-      if (!guilds[targetGuildId].members || !guilds[targetGuildId].members.includes(username)) {
-        return socket.emit('chat-message', {
-           id: Date.now(),
-           author: "System",
-           text: "Brak uprawnień do tego pokoju. Prawdopodobnie nie jesteś na liście autoryzowanych członków gildii.",
-           channel: roomId,
-           type: 'text'
-        });
+      if (!username || !guilds[targetGuildId].members || !guilds[targetGuildId].members.includes(username)) {
+        console.warn(`[AUTH-GUARD] join-room: Brak uprawnień dla użytkownika ${username} w gildii ${targetGuildId}`);
+        return;
       }
     }
 
@@ -1059,6 +1057,24 @@ io.on('connection', (socket) => {
     };
     saveGuilds();
     updateAllRoomStates();
+  });
+
+  socket.on('join-guild', ({ guildId }) => {
+    const user = users[socket.id];
+    if (!user || !user.username || !guilds[guildId]) return;
+
+    const guild = guilds[guildId];
+    if (!guild.members) guild.members = [];
+    
+    if (!guild.members.includes(user.username)) {
+      guild.members.push(user.username);
+      if (!guild.memberMetadata) guild.memberMetadata = {};
+      guild.memberMetadata[user.username] = { firstJoinedAt: Date.now(), lastJoinedAt: Date.now() };
+      
+      saveGuilds();
+      updateAllRoomStates();
+      console.log(`[GUILD] Użytkownik ${user.username} dołączył do gildii: ${guild.name} (${guildId})`);
+    }
   });
 
   socket.on('leave-guild', ({ guildId }) => {
