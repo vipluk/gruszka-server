@@ -33,19 +33,41 @@ if (GOOGLE_REFRESH_TOKEN) {
 
 const drive = google.drive({ version: 'v3', auth: googleClient });
 let pearServerFolderId = null;
+let backupsFolderId = null; // Folder dla rotowanych backupów 24h
+
+let pearFriendsFolderId = null;
+let friendsBackupsFolderId = null;
 
 const users = {}; // socket.id -> { username, avatar, rooms: Set, mic: bool, deaf: bool, status: string }
 const gracePeriodUsers = new Map(); // username -> setTimeout ID
+let isSyncEnabled = true; // Bezpiecznik: Jeśli ładowanie danych zawiedzie, blokujemy wysyłanie pustych danych do chmury!
+
+// --- POMOCNICZE FUNKCJE BEZPIECZEŃSTWA (BACKUPY) ---
+function createLocalBackup(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  try {
+    const backupPath = filePath + '.bak';
+    fs.copyFileSync(filePath, backupPath);
+  } catch (err) {
+    console.error(`[SAFETY] Błąd tworzenia kopii zapasowej ${filePath}:`, err.message);
+  }
+}
 
 // --- TRWAŁA HISTORIA CZATU W PLIKU JSON ---
 const HISTORY_FILE = path.join(__dirname, 'chat-history.json');
 let messageBuffer = [];
 
+const DM_HISTORY_FILE = path.join(__dirname, 'dm-history.json');
+let dmMessageBuffer = [];
+
 // --- TRWAŁA KONFIGURACJA GILDII W PLIKU JSON ---
 const GUILDS_FILE = path.join(__dirname, 'guilds.json');
 const USERS_FILE = path.join(__dirname, 'users.json');
+const FRIENDS_FILE = path.join(__dirname, 'friends.json');
+
 let guilds = {};
 let allSeenUsers = {};
+let friendsData = {}; // Zastępuje obiekty friends i friendRequests z allSeenUsers
 
 // Domyślna gildia Lobby jeśli pusto
 const ensureLobby = () => {
@@ -73,17 +95,7 @@ const ensureLobby = () => {
   }
 };
 
-const saveUsers = () => {
-  try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(allSeenUsers, null, 2));
-    syncFileToDrive(USERS_FILE, 'users.json');
-    console.log("[STORAGE] Zapisano users.json i wysłano do chmury.");
-  } catch (err) {
-    console.error('Błąd zapisu users.json:', err);
-  }
-};
-
-// --- LOGIKA SYNCHRONIZACJI Z DRIVE (/pear/server) ---
+ // --- LOGIKA SYNCHRONIZACJI Z DRIVE (/pear/server) ---
 async function ensureServerFolder() {
   if (!GOOGLE_REFRESH_TOKEN) return null;
   try {
@@ -114,7 +126,53 @@ async function ensureServerFolder() {
     }
     pearServerFolderId = srvId;
     console.log("✅ Połączono z folderem Drive: /pear/server (ID:", pearServerFolderId, ")");
-    return pearServerFolderId;
+
+    // 3. Szukaj folderu 'backups' w 'server'
+    const qBak = `name='backups' and '${srvId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    const resBak = await drive.files.list({ q: qBak, fields: 'files(id)' });
+    let bakId = resBak.data.files?.[0]?.id;
+
+    if (!bakId) {
+      const createBak = await drive.files.create({
+        requestBody: { name: 'backups', parents: [srvId], mimeType: 'application/vnd.google-apps.folder' },
+        fields: 'id'
+      });
+      bakId = createBak.data.id;
+    }
+    backupsFolderId = bakId;
+    console.log("📁 Folder backupów gotowy (ID:", backupsFolderId, ")");
+
+    // 4. Szukaj folderu 'friends' w 'pear'
+    const qFnd = `name='friends' and '${pearId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    const resFnd = await drive.files.list({ q: qFnd, fields: 'files(id)' });
+    let fndId = resFnd.data.files?.[0]?.id;
+
+    if (!fndId) {
+      const createFnd = await drive.files.create({
+        requestBody: { name: 'friends', parents: [pearId], mimeType: 'application/vnd.google-apps.folder' },
+        fields: 'id'
+      });
+      fndId = createFnd.data.id;
+    }
+    pearFriendsFolderId = fndId;
+    console.log("✅ Połączono z folderem Drive: /pear/friends (ID:", pearFriendsFolderId, ")");
+
+    // 5. Szukaj folderu 'backups' w 'friends'
+    const qFBak = `name='backups' and '${fndId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    const resFBak = await drive.files.list({ q: qFBak, fields: 'files(id)' });
+    let fBakId = resFBak.data.files?.[0]?.id;
+
+    if (!fBakId) {
+      const createFBak = await drive.files.create({
+        requestBody: { name: 'backups', parents: [fndId], mimeType: 'application/vnd.google-apps.folder' },
+        fields: 'id'
+      });
+      fBakId = createFBak.data.id;
+    }
+    friendsBackupsFolderId = fBakId;
+    console.log("📁 Folder backupów DM gotowy (ID:", friendsBackupsFolderId, ")");
+
+    return true;
   } catch (e) {
     console.error("❌ Błąd folderów Drive:", e.message);
     return null;
@@ -123,20 +181,87 @@ async function ensureServerFolder() {
 
 const syncTimeouts = {};
 
-function syncFileToDrive(localPath, driveFileName) {
+// --- AUTOMATYCZNE BACKUPY 24H Z ROTACJĄ (3 wersje na typ pliku) ---
+async function runCloudBackup() {
+  if (!isSyncEnabled) {
+    console.log("⚠️ [BACKUP] Pominięto backup (Sync Lock aktywny).");
+    return;
+  }
+
+  const dateStr = new Date().toISOString().split('T')[0];
+  console.log(`[BACKUP] Rozpoczynam dobową kopię zapasową: ${dateStr}`);
+
+  const filesToBackup = [
+    { local: USERS_FILE, driveName: `backup-users-${dateStr}.json`, targetDir: backupsFolderId },
+    { local: GUILDS_FILE, driveName: `backup-guilds-${dateStr}.json`, targetDir: backupsFolderId },
+    { local: HISTORY_FILE, driveName: `backup-history-${dateStr}.json`, targetDir: backupsFolderId },
+    { local: FRIENDS_FILE, driveName: `backup-friends-${dateStr}.json`, targetDir: friendsBackupsFolderId },
+    { local: DM_HISTORY_FILE, driveName: `backup-dm-history-${dateStr}.json`, targetDir: friendsBackupsFolderId }
+  ];
+
+  for (const f of filesToBackup) {
+    if (!fs.existsSync(f.local) || !f.targetDir) continue;
+    try {
+      const content = fs.readFileSync(f.local, 'utf8');
+      JSON.parse(content); // Weryfikacja przed wysyłką
+
+      await drive.files.create({
+        requestBody: { name: f.driveName, parents: [f.targetDir] },
+        media: { mimeType: 'application/json', body: content }
+      });
+      console.log(`✅ [BACKUP] Wysłano: ${f.driveName}`);
+    } catch (e) {
+      console.error(`❌ [BACKUP] Błąd pliku ${f.local}:`, e.message);
+    }
+  }
+
+  await rotateFolderBackups(backupsFolderId, ['users', 'guilds', 'history']);
+  await rotateFolderBackups(friendsBackupsFolderId, ['friends', 'dm-history']);
+}
+
+async function rotateFolderBackups(folderId, categories) {
+  if (!folderId) return;
+  try {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and trashed=false`,
+      fields: 'files(id, name, createdTime)',
+      orderBy: 'createdTime desc'
+    });
+    const files = res.data.files || [];
+
+    for (const cat of categories) {
+      const catFiles = files.filter(f => f.name.includes(`backup-${cat}-`));
+      if (catFiles.length > 3) {
+        const toDelete = catFiles.slice(3);
+        for (const df of toDelete) {
+          await drive.files.delete({ fileId: df.id });
+          console.log(`🗑️ [ROTATE] Usunięto stary backup: ${df.name}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.error("❌ [ROTATE] Błąd rotacji backupów:", e.message);
+  }
+}
+
+function syncFileToDrive(localPath, driveFileName, targetFolderId = pearServerFolderId) {
+  if (!isSyncEnabled) {
+    console.log(`⚠️ [SAFETY] Synchronizacja ${driveFileName} zablokowana (Sync Lock).`);
+    return;
+  }
+
   if (syncTimeouts[driveFileName]) {
     clearTimeout(syncTimeouts[driveFileName]);
   }
   
-  syncTimeouts[driveFileName] = setTimeout(async () => {
-    if (!pearServerFolderId || !fs.existsSync(localPath)) return;
+    syncTimeouts[driveFileName] = setTimeout(async () => {
+    if (!targetFolderId || !fs.existsSync(localPath)) return;
     try {
       // Sprawdź czy plik istnieje
-      const q = `name='${driveFileName}' and '${pearServerFolderId}' in parents and trashed=false`;
+      const q = `name='${driveFileName}' and '${targetFolderId}' in parents and trashed=false`;
       const res = await drive.files.list({ q, fields: 'files(id)' });
       const fileId = res.data.files?.[0]?.id;
 
-      // Zamiast createReadStream używamy readFileSync by wyeliminować Stream Crash w Gaxios
       const fileContent = fs.readFileSync(localPath, 'utf8');
       const media = { mimeType: 'application/json', body: fileContent };
 
@@ -144,7 +269,7 @@ function syncFileToDrive(localPath, driveFileName) {
         await drive.files.update({ fileId, media });
       } else {
         await drive.files.create({
-          requestBody: { name: driveFileName, parents: [pearServerFolderId] },
+          requestBody: { name: driveFileName, parents: [targetFolderId] },
           media
         });
       }
@@ -154,23 +279,41 @@ function syncFileToDrive(localPath, driveFileName) {
   }, 2500); // 2.5 sekundy debounce by zapobiec blokadom Google API
 }
 
-async function downloadFromDrive(fileName, localPath) {
-  if (!pearServerFolderId) return;
+async function downloadFromDrive(fileName, localPath, targetFolderId = pearServerFolderId) {
+  if (!targetFolderId) return;
   try {
-    const q = `name='${fileName}' and '${pearServerFolderId}' in parents and trashed=false`;
+    const q = `name='${fileName}' and '${targetFolderId}' in parents and trashed=false`;
     const res = await drive.files.list({ q, fields: 'files(id)' });
     const fileId = res.data.files?.[0]?.id;
     if (!fileId) return;
 
-    const dest = fs.createWriteStream(localPath);
+    const tmpPath = localPath + '.tmp';
+    const dest = fs.createWriteStream(tmpPath);
     const driveRes = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
     
-    return new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
+      dest.on('finish', resolve);
+      dest.on('error', reject);
       driveRes.data
-        .on('end', () => { console.log(`💾 Pomyślnie pobrano ${fileName} z Drive.`); resolve(); })
-        .on('error', (err) => reject(err))
+        .on('error', reject)
         .pipe(dest);
     });
+
+    // WERYFIKACJA POBRANEGO PLIKU
+    try {
+      const content = fs.readFileSync(tmpPath, 'utf8');
+      if (content.trim().length === 0) throw new Error("Plik jest pusty");
+      JSON.parse(content); // Sprawdź czy to poprawny JSON
+      
+      // Jeśli OK, podmień plik lokalny
+      if (fs.existsSync(localPath)) createLocalBackup(localPath);
+      fs.renameSync(tmpPath, localPath);
+      console.log(`💾 Pomyślnie pobrano i zweryfikowano ${fileName} z Drive.`);
+    } catch (e) {
+      console.error(`⚠️ [SAFETY] Pobrany ${fileName} jest uszkodzony lub pusty. Ignoruję nadpisanie lokalne.`);
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      isSyncEnabled = false; // LOCK: Nie pozwalamy na sync-back, skoro pobranie się nie udało!
+    }
   } catch (e) {
     console.error(`❌ Błąd pobierania ${fileName} z Drive:`, e.message);
   }
@@ -182,9 +325,13 @@ async function initCloud() {
   try {
     await ensureServerFolder();
     if (pearServerFolderId) {
-      await downloadFromDrive('guilds.json', GUILDS_FILE);
-      await downloadFromDrive('chat-history.json', HISTORY_FILE);
-      await downloadFromDrive('users.json', USERS_FILE);
+      await downloadFromDrive('guilds.json', GUILDS_FILE, pearServerFolderId);
+      await downloadFromDrive('chat-history.json', HISTORY_FILE, pearServerFolderId);
+      await downloadFromDrive('users.json', USERS_FILE, pearServerFolderId);
+      if (pearFriendsFolderId) {
+        await downloadFromDrive('friends.json', FRIENDS_FILE, pearFriendsFolderId);
+        await downloadFromDrive('dm-history.json', DM_HISTORY_FILE, pearFriendsFolderId);
+      }
       console.log("[CLOUD] Synchronizacja zakończona sukcesem.");
     } else {
       console.warn("[CLOUD] Brak folderu serwera na Drive - działam w trybie lokalnym.");
@@ -194,6 +341,12 @@ async function initCloud() {
   } finally {
     // Zawsze ładujemy dane (chociażby lokalne), aby serwer nie był pusty
     loadAllData();
+    
+    // Zaplanuj backupy 24h
+    setInterval(runCloudBackup, 24 * 60 * 60 * 1000);
+    // Wykonaj pierwszy backup po 10 sekundach od startu (po pobraniu z chmury)
+    setTimeout(runCloudBackup, 10000);
+
     // Powiadomienie wszystkich połączonych o nowych danych
     io.emit('chat-buffer', messageBuffer.filter(m => {
       if (!m.channel) return false;
@@ -204,40 +357,108 @@ async function initCloud() {
 }
 
 function loadAllData() {
+  // HISTORY FILE
   if (fs.existsSync(HISTORY_FILE)) {
     try {
       messageBuffer = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-      console.log(`Załadowano ${messageBuffer.length} wiadomości.`);
-    } catch (e) { }
+      console.log(`Załadowano ${messageBuffer.length} wiadomości globalnych.`);
+    } catch (e) { 
+      console.error("⚠️ [SAFETY] Uszkodzony plik history. Załadowano pusty bufor.");
+      isSyncEnabled = false; 
+    }
   }
+  
+  // DM HISTORY FILE
+  if (fs.existsSync(DM_HISTORY_FILE)) {
+    try {
+      dmMessageBuffer = JSON.parse(fs.readFileSync(DM_HISTORY_FILE, 'utf8'));
+      console.log(`Załadowano ${dmMessageBuffer.length} wiadomości prywatnych DM.`);
+    } catch (e) { 
+      console.error("⚠️ [SAFETY] Uszkodzony plik dm-history. Załadowano pusty bufor DM.");
+      isSyncEnabled = false; 
+    }
+  }
+
+  // MIGRACJA WIADOMOŚCI DM ZE STAREGO CHAT-HISTORY W LOCIE
+  if (messageBuffer.length > 0) {
+    const dmExtract = messageBuffer.filter(m => m.channel && m.channel.startsWith('dm-'));
+    if (dmExtract.length > 0) {
+      console.log(`🛠 Wykryto zaszłe wiadomości DM (${dmExtract.length}) w głównym pliku. Wykonuję migrację...`);
+      const existingDmIds = new Set(dmMessageBuffer.map(m => m.id));
+      dmExtract.forEach(dmMsg => {
+        if (!existingDmIds.has(dmMsg.id)) dmMessageBuffer.push(dmMsg);
+      });
+      dmMessageBuffer.sort((a, b) => a.id - b.id);
+      messageBuffer = messageBuffer.filter(m => !m.channel || !m.channel.startsWith('dm-'));
+      saveDmHistory();
+      saveHistory(); // Oczyszcza stary log
+    }
+  }
+
+  // GUILDS
   if (fs.existsSync(GUILDS_FILE)) {
     try {
       guilds = JSON.parse(fs.readFileSync(GUILDS_FILE, 'utf8'));
       console.log(`Załadowano ${Object.keys(guilds).length} gildi.`);
-    } catch (e) { }
+    } catch (e) { 
+      console.error("⚠️ [SAFETY] Uszkodzony plik guilds! Blokuję synchronizację Cloud.");
+      isSyncEnabled = false; 
+    }
   }
+  
+  // FRIENDS DATA
+  if (fs.existsSync(FRIENDS_FILE)) {
+    try {
+      friendsData = JSON.parse(fs.readFileSync(FRIENDS_FILE, 'utf8'));
+      console.log(`Załadowano pulę relacji przyjaciół dla ${Object.keys(friendsData).length} osób.`);
+    } catch (e) {
+      console.error("⚠️ [SAFETY] Uszkodzony plik friends! Blokuję synchronizację Cloud.");
+      isSyncEnabled = false; 
+    }
+  }
+
+  // USERS DATA
   if (fs.existsSync(USERS_FILE)) {
     try {
       allSeenUsers = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
       console.log(`Załadowano ${Object.keys(allSeenUsers).length} użytkowników.`);
       
-      // MIGRACJA: Dodaj nickname i registeredAt jeśli ich nie ma
-      let migrated = false;
+      let usersMigrated = false;
+      let friendsMigrated = false;
+
       Object.keys(allSeenUsers).forEach(uName => {
-        if (!allSeenUsers[uName].nickname) {
-          allSeenUsers[uName].nickname = uName;
-          migrated = true;
-        }
-        if (!allSeenUsers[uName].registeredAt) {
-          allSeenUsers[uName].registeredAt = Date.now();
-          migrated = true;
+        const u = allSeenUsers[uName];
+        if (!u.nickname) { u.nickname = uName; usersMigrated = true; }
+        if (!u.registeredAt) { u.registeredAt = Date.now(); usersMigrated = true; }
+        
+        // WYCIĄGANIE LISTY ZNAJOMYCH DO ODSEPAROWANEGO OBIEKTU Z PROFILU
+        if (u.friends !== undefined || u.friendRequests !== undefined) {
+          friendsMigrated = true;
+          if (!friendsData[uName]) friendsData[uName] = { friends: [], friendRequests: [] };
+          // Złącz istniejące i te z profilu na wszelki wypadek
+          const mergedFriends = new Set([...(friendsData[uName].friends||[]), ...(u.friends||[])]);
+          const mergedReq = new Set([...(friendsData[uName].friendRequests||[]), ...(u.friendRequests||[])]);
+          friendsData[uName].friends = Array.from(mergedFriends);
+          friendsData[uName].friendRequests = Array.from(mergedReq);
+          // Usuń z profilu głównego u.
+          delete u.friends;
+          delete u.friendRequests;
+          usersMigrated = true;
         }
       });
-      if (migrated) {
-        console.log("🛠 Wykryto brakujące dane profilowe - przeprowadzono migrację.");
+      
+      if (friendsMigrated) {
+        console.log("🛠 Zakończono ekstrakcję relacji do struktury friendsData.");
+        saveFriends();
+      }
+      if (usersMigrated) {
+        console.log("🛠 Wyczyszczono profiles i zapisano zrewidowaną konfigurację users.");
         saveUsers();
       }
-    } catch (e) { }
+    } catch (e) { 
+      console.error("⚠️ [SAFETY] Uszkodzony plik users! Blokuję synchronizację Cloud.", e);
+      isSyncEnabled = false; 
+    }
   }
 
   // MIGRACJA GILDII: Dodaj memberMetadata jeśli go nie ma
@@ -251,19 +472,52 @@ function loadAllData() {
 const saveHistory = () => {
   try {
     if (messageBuffer.length > 10000) messageBuffer = messageBuffer.slice(-10000);
+    createLocalBackup(HISTORY_FILE);
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(messageBuffer, null, 2));
-    syncFileToDrive(HISTORY_FILE, 'chat-history.json');
+    syncFileToDrive(HISTORY_FILE, 'chat-history.json', pearServerFolderId);
   } catch (err) {
     console.error('Błąd zapisu chat-history.json:', err);
   }
 };
 
+const saveDmHistory = () => {
+  try {
+    if (dmMessageBuffer.length > 10000) dmMessageBuffer = dmMessageBuffer.slice(-10000);
+    createLocalBackup(DM_HISTORY_FILE);
+    fs.writeFileSync(DM_HISTORY_FILE, JSON.stringify(dmMessageBuffer, null, 2));
+    syncFileToDrive(DM_HISTORY_FILE, 'dm-history.json', pearFriendsFolderId);
+  } catch (err) {
+    console.error('Błąd zapisu dm-history.json:', err);
+  }
+};
+
 const saveGuilds = () => {
   try {
+    createLocalBackup(GUILDS_FILE);
     fs.writeFileSync(GUILDS_FILE, JSON.stringify(guilds, null, 2));
-    syncFileToDrive(GUILDS_FILE, 'guilds.json');
+    syncFileToDrive(GUILDS_FILE, 'guilds.json', pearServerFolderId);
   } catch (err) {
     console.error('Błąd zapisu guilds.json:', err);
+  }
+};
+
+const saveUsers = () => {
+  try {
+    createLocalBackup(USERS_FILE);
+    fs.writeFileSync(USERS_FILE, JSON.stringify(allSeenUsers, null, 2));
+    syncFileToDrive(USERS_FILE, 'users.json', pearServerFolderId);
+  } catch (err) {
+    console.error('Błąd zapisu users.json:', err);
+  }
+};
+
+const saveFriends = () => {
+  try {
+    createLocalBackup(FRIENDS_FILE);
+    fs.writeFileSync(FRIENDS_FILE, JSON.stringify(friendsData, null, 2));
+    syncFileToDrive(FRIENDS_FILE, 'friends.json', pearFriendsFolderId);
+  } catch (err) {
+    console.error('Błąd zapisu friends.json:', err);
   }
 };
 
@@ -344,7 +598,7 @@ const updateAllRoomStates = () => {
   });
 
   allRooms.forEach(roomId => {
-    const usersInRoom = Array.from(io.sockets.adapter.rooms.get(roomId) || [])
+    let usersInRoom = Array.from(io.sockets.adapter.rooms.get(roomId) || [])
       .map(id => {
         const uName = users[id]?.username;
         return {
@@ -359,11 +613,66 @@ const updateAllRoomStates = () => {
         };
       })
       .filter(u => u.username != null);
+    
+    // Deduplikacja, aby jeden użytkownik (np. 2 karty lub zatrzaśnięty socket) nie był podwójnie
+    const uniqueUsersMap = new Map();
+    usersInRoom.forEach(u => {
+      uniqueUsersMap.set(u.username, u);
+    });
+    usersInRoom = Array.from(uniqueUsersMap.values());
+    
+    // NOWOŚĆ: Dodaj osoby, które są w Grace Period, ale były w tym pokoju głosowym
+    if (roomId.startsWith('voice-') || roomId === 'Lobby') {
+      gracePeriodUsers.forEach((_, username) => {
+        const profile = allSeenUsers[username];
+        if (profile && profile.voiceRoomId === roomId) {
+          if (!uniqueUsersMap.has(username)) {
+            usersInRoom.push({
+              username: username,
+              nickname: profile.nickname || username,
+              registeredAt: profile.registeredAt,
+              avatar: profile.avatar,
+              mic: profile.lastMicStatus || false,
+              deaf: profile.lastDeafStatus || false,
+              status: 'away',
+              customText: profile.customText || '',
+              reconnecting: true
+            });
+            uniqueUsersMap.set(username, true);
+          }
+        }
+      });
+    }
+
     roomsData[roomId] = usersInRoom;
+  });
+
+  // Wzbogać wszystkich o listy znajomych przed wysłaniem stanu
+  Object.keys(broadcastUsers).forEach(username => {
+    if (friendsData[username]) {
+      broadcastUsers[username].friends = friendsData[username].friends || [];
+      broadcastUsers[username].friendRequests = friendsData[username].friendRequests || [];
+    } else {
+      broadcastUsers[username].friends = [];
+      broadcastUsers[username].friendRequests = [];
+    }
   });
 
   io.emit('global-room-update', { rooms: roomsData, users: broadcastUsers, guilds, onlineUsernames });
 };
+
+function sendChatBuffer(socket, targetRoom) {
+  const channel = targetRoom || "Ogólny";
+  if (channel.startsWith('dm-')) {
+    socket.emit('chat-buffer', dmMessageBuffer.filter(m => m.channel === channel));
+  } else {
+    socket.emit('chat-buffer', messageBuffer.filter(m => {
+      if (!m.channel) return false;
+      if (channel.toLowerCase() === "ogólny") return m.channel.toLowerCase() === "ogólny";
+      return m.channel === channel;
+    }));
+  }
+}
 
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
@@ -460,7 +769,7 @@ io.on('connection', (socket) => {
         accessToken: tokens.access_token
       });
 
-      socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === (roomId || "Ogólny")));
+      sendChatBuffer(socket, roomId);
       updateAllRoomStates();
     } catch (e) {
       console.error("[AUTH] Błąd wymiany kodu:", e.message);
@@ -561,7 +870,24 @@ io.on('connection', (socket) => {
       allSeenUsers[foundUser.username].status = users[socket.id].status;
       allSeenUsers[foundUser.username].customText = users[socket.id].customText;
       allSeenUsers[foundUser.username].lastSeen = Date.now();
+      
+      // Przywracamy mikrofon i słuchawki z bazy jeśli użytkownik wraca
+      if (allSeenUsers[foundUser.username].lastMicStatus !== undefined) {
+         users[socket.id].mic = allSeenUsers[foundUser.username].lastMicStatus;
+      }
+      if (allSeenUsers[foundUser.username].lastDeafStatus !== undefined) {
+         users[socket.id].deaf = allSeenUsers[foundUser.username].lastDeafStatus;
+      }
+
       if (needsSave || true) saveUsers(); // Zawsze zapisujemy aktywność
+
+      // Automatyczne dołączenie do kanału głosowego jeśli był w nim wcześniej
+      const voiceRoom = allSeenUsers[foundUser.username].voiceRoomId;
+      if (voiceRoom) {
+         socket.join(voiceRoom);
+         users[socket.id].rooms.add(voiceRoom);
+         console.log(`[VOICE] Przywrócono ${foundUser.username} do kanału głosowego: ${voiceRoom}`);
+      }
 
       socket.join(roomId || "Ogólny");
       users[socket.id].rooms.add(roomId || "Ogólny");
@@ -575,21 +901,11 @@ io.on('connection', (socket) => {
         status: users[socket.id].status,
         customText: users[socket.id].customText,
         sessionToken: token,
-        accessToken: foundUser.accessToken
+        accessToken: foundUser.accessToken,
+        voiceRoomId: voiceRoom || null // Informujemy klienta, żeby też wiedział że go tam daliśmy
       });
 
-      const targetRoom = roomId || "Ogólny";
-      const filteredBuffer = messageBuffer.filter(m => {
-        if (!m.channel) return false;
-        // Odporność na wielkość liter dla głównego kanału
-        if (targetRoom.toLowerCase() === "ogólny") {
-          return m.channel.toLowerCase() === "ogólny";
-        }
-        return m.channel === targetRoom;
-      });
-
-      socket.emit('chat-buffer', filteredBuffer);
-      console.log(`[SESSION] Wysłano ${filteredBuffer.length} wiadomości do ${foundUser.username} dla kanału ${targetRoom}`);
+      sendChatBuffer(socket, roomId);
       updateAllRoomStates();
 
       if (roomId && (roomId.startsWith('voice-') || roomId === 'Lobby')) {
@@ -650,9 +966,16 @@ io.on('connection', (socket) => {
     socket.join(roomId);
     users[socket.id].username = username;
     users[socket.id].rooms.add(roomId);
-    socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
+    sendChatBuffer(socket, roomId);
     
-    // Analityka dołączania do gildii
+    // Zapisywanie kanału głosowego
+    if (username && (roomId.startsWith('voice-') || roomId === 'Lobby')) {
+      if (allSeenUsers[username]) {
+        allSeenUsers[username].voiceRoomId = roomId;
+        saveUsers();
+        console.log(`[VOICE] Użytkownik ${username} wszedł do pokoju: ${roomId}`);
+      }
+    }
 
     if (targetGuildId && guilds[targetGuildId]) {
       if (!guilds[targetGuildId].memberMetadata) guilds[targetGuildId].memberMetadata = {};
@@ -675,6 +998,14 @@ io.on('connection', (socket) => {
     if (users[socket.id]) {
       users[socket.id].mic = mic;
       users[socket.id].deaf = deaf;
+      
+      const username = users[socket.id].username;
+      if (username && allSeenUsers[username]) {
+        allSeenUsers[username].lastMicStatus = mic;
+        allSeenUsers[username].lastDeafStatus = deaf;
+        saveUsers();
+      }
+      
       updateAllRoomStates();
     }
   });
@@ -785,10 +1116,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat-message', (payload) => {
-    messageBuffer.push(payload);
-    // Zachowuje maksymalnie 10000 wiadomości globalnych w pliku!
-    if (messageBuffer.length > 10000) messageBuffer.shift();
-    saveHistory();
+    if (payload.channel && payload.channel.startsWith('dm-')) {
+      dmMessageBuffer.push(payload);
+      if (dmMessageBuffer.length > 10000) dmMessageBuffer.shift();
+      saveDmHistory();
+    } else {
+      messageBuffer.push(payload);
+      // Zachowuje maksymalnie 10000 wiadomości globalnych w pliku!
+      if (messageBuffer.length > 10000) messageBuffer.shift();
+      saveHistory();
+    }
 
     socket.to(payload.roomId).emit('chat-message', payload);
   });
@@ -814,7 +1151,82 @@ io.on('connection', (socket) => {
     socket.leave(roomId);
     if (users[socket.id]) {
       users[socket.id].rooms.delete(roomId);
+      
+      const username = users[socket.id].username;
+      if (username && allSeenUsers[username] && (roomId.startsWith('voice-') || roomId === 'Lobby')) {
+        if (allSeenUsers[username].voiceRoomId === roomId) {
+           allSeenUsers[username].voiceRoomId = null;
+           saveUsers();
+           console.log(`[VOICE] Użytkownik ${username} opuścił pokój: ${roomId}`);
+        }
+      }
     }
+    updateAllRoomStates();
+  });
+
+  socket.on('send-friend-request', ({ targetUsername }) => {
+    const user = users[socket.id];
+    if (!user || !user.username || user.username === targetUsername) return;
+    
+    if (!friendsData[targetUsername]) friendsData[targetUsername] = { friends: [], friendRequests: [] };
+    if (!friendsData[user.username]) friendsData[user.username] = { friends: [], friendRequests: [] };
+
+    const targetProfile = friendsData[targetUsername];
+    const myProfile = friendsData[user.username];
+
+    // Jeśli on już nam wysłał -> automatycznie akceptujemy!
+    if (myProfile.friendRequests.includes(targetUsername)) {
+      myProfile.friendRequests = myProfile.friendRequests.filter(u => u !== targetUsername);
+      if (!myProfile.friends.includes(targetUsername)) myProfile.friends.push(targetUsername);
+      if (!targetProfile.friends.includes(user.username)) targetProfile.friends.push(user.username);
+    } else {
+      // Wyślij zaproszenie (jeśli jeszcze nie ma i nie jesteśmy znajomymi)
+      if (!targetProfile.friendRequests.includes(user.username) && !targetProfile.friends.includes(user.username)) {
+        targetProfile.friendRequests.push(user.username);
+      }
+    }
+    
+    saveFriends();
+    updateAllRoomStates();
+  });
+
+  socket.on('accept-friend-request', ({ targetUsername }) => {
+    const user = users[socket.id];
+    if (!user || !user.username) return;
+
+    if (!friendsData[targetUsername]) friendsData[targetUsername] = { friends: [], friendRequests: [] };
+    if (!friendsData[user.username]) friendsData[user.username] = { friends: [], friendRequests: [] };
+
+    const targetProfile = friendsData[targetUsername];
+    const myProfile = friendsData[user.username];
+    
+    // Usuń z zaproszeń i dodaj do znajomych
+    myProfile.friendRequests = myProfile.friendRequests.filter(u => u !== targetUsername);
+    if (!myProfile.friends.includes(targetUsername)) myProfile.friends.push(targetUsername);
+    if (!targetProfile.friends.includes(user.username)) targetProfile.friends.push(user.username);
+
+    saveFriends();
+    updateAllRoomStates();
+  });
+
+  socket.on('remove-friend', ({ targetUsername }) => {
+    const user = users[socket.id];
+    if (!user || !user.username) return;
+
+    if (!friendsData[targetUsername]) friendsData[targetUsername] = { friends: [], friendRequests: [] };
+    if (!friendsData[user.username]) friendsData[user.username] = { friends: [], friendRequests: [] };
+
+    const targetProfile = friendsData[targetUsername];
+    const myProfile = friendsData[user.username];
+
+    myProfile.friends = myProfile.friends.filter(u => u !== targetUsername);
+    targetProfile.friends = targetProfile.friends.filter(u => u !== user.username);
+    
+    // Możliwość cofnięcia zaproszenia w ten sam sposób
+    targetProfile.friendRequests = targetProfile.friendRequests.filter(u => u !== user.username);
+    myProfile.friendRequests = myProfile.friendRequests.filter(u => u !== targetUsername);
+
+    saveFriends();
     updateAllRoomStates();
   });
 
@@ -826,6 +1238,11 @@ io.on('connection', (socket) => {
     if (typeof cb === 'function') cb();
   });
 
+  socket.on('explicit-logout', () => {
+    const user = users[socket.id];
+    if (user) user.explicitlyLoggedOut = true;
+  });
+
   socket.on('disconnect', () => {
     for (const hash in fileOwners) {
       if (fileOwners[hash]) fileOwners[hash].delete(socket.id);
@@ -835,24 +1252,26 @@ io.on('connection', (socket) => {
     const user = users[socket.id];
     
     if (user && user.username) {
-      // Dajemy użytkownikowi 2.5 sekundy na ponowne połączenie
-      console.log(`[PRESENCE] ${user.username} rozłączony - start Grace Period (2.5s).`);
+      const waitTime = user.explicitlyLoggedOut ? 1000 : 30000;
+      console.log(`[PRESENCE] ${user.username} rozłączony - start Grace Period (${waitTime/1000}s).`);
       
       const timeoutId = setTimeout(() => {
         const stillStreaming = Array.from(io.sockets.sockets.values())
           .some(s => users[s.id]?.username === user.username);
         
         if (!stillStreaming) {
-          console.log(`[PRESENCE] ${user.username} zniknął ostatecznie po 2.5s.`);
+          console.log(`[PRESENCE] ${user.username} zniknął ostatecznie po ${waitTime/1000}s.`);
           if (allSeenUsers[user.username]) {
             allSeenUsers[user.username].status = 'offline';
+            // NIE usuwamy voiceRoomId podczas timeoutu - usuniemy dopiero przy całkowitym logoutcie
+            // lub jeśli użytkownik połączy się i wyjdzie ręcznie.
             allSeenUsers[user.username].lastSeen = Date.now();
             saveUsers();
           }
         }
         gracePeriodUsers.delete(user.username);
         updateAllRoomStates();
-      }, 2500);
+      }, waitTime);
 
       gracePeriodUsers.set(user.username, timeoutId);
     }
