@@ -64,10 +64,12 @@ let dmMessageBuffer = [];
 const GUILDS_FILE = path.join(__dirname, 'guilds.json');
 const USERS_FILE = path.join(__dirname, 'users.json');
 const FRIENDS_FILE = path.join(__dirname, 'friends.json');
+const DEVICE_SETTINGS_FILE = path.join(__dirname, 'device-settings.json');
 
 let guilds = {};
 let allSeenUsers = {};
 let friendsData = {}; // Zastępuje obiekty friends i friendRequests z allSeenUsers
+let deviceSettings = {};
 
 // Domyślna gildia Lobby jeśli pusto
 const ensureLobby = () => {
@@ -196,7 +198,8 @@ async function runCloudBackup() {
     { local: GUILDS_FILE, driveName: `backup-guilds-${dateStr}.json`, targetDir: backupsFolderId },
     { local: HISTORY_FILE, driveName: `backup-history-${dateStr}.json`, targetDir: backupsFolderId },
     { local: FRIENDS_FILE, driveName: `backup-friends-${dateStr}.json`, targetDir: friendsBackupsFolderId },
-    { local: DM_HISTORY_FILE, driveName: `backup-dm-history-${dateStr}.json`, targetDir: friendsBackupsFolderId }
+    { local: DM_HISTORY_FILE, driveName: `backup-dm-history-${dateStr}.json`, targetDir: friendsBackupsFolderId },
+    { local: DEVICE_SETTINGS_FILE, driveName: `backup-device-settings-${dateStr}.json`, targetDir: backupsFolderId }
   ];
 
   for (const f of filesToBackup) {
@@ -328,6 +331,7 @@ async function initCloud() {
       await downloadFromDrive('guilds.json', GUILDS_FILE, pearServerFolderId);
       await downloadFromDrive('chat-history.json', HISTORY_FILE, pearServerFolderId);
       await downloadFromDrive('users.json', USERS_FILE, pearServerFolderId);
+      await downloadFromDrive('device-settings.json', DEVICE_SETTINGS_FILE, pearServerFolderId);
       if (pearFriendsFolderId) {
         await downloadFromDrive('friends.json', FRIENDS_FILE, pearFriendsFolderId);
         await downloadFromDrive('dm-history.json', DM_HISTORY_FILE, pearFriendsFolderId);
@@ -466,8 +470,29 @@ function loadAllData() {
     if (!guilds[gId].memberMetadata) guilds[gId].memberMetadata = {};
   });
 
+  // DEVICE SETTINGS
+  if (fs.existsSync(DEVICE_SETTINGS_FILE)) {
+    try {
+      deviceSettings = JSON.parse(fs.readFileSync(DEVICE_SETTINGS_FILE, 'utf8'));
+      console.log(`Załadowano ustawienia dla ${Object.keys(deviceSettings).length} urządzeń.`);
+    } catch (e) {
+      console.error("⚠️ [SAFETY] Uszkodzony plik device-settings! Blokuję synchronizację Cloud.");
+      isSyncEnabled = false;
+    }
+  }
+
   ensureLobby();
 }
+
+const saveDeviceSettings = () => {
+  try {
+    createLocalBackup(DEVICE_SETTINGS_FILE);
+    fs.writeFileSync(DEVICE_SETTINGS_FILE, JSON.stringify(deviceSettings, null, 2));
+    syncFileToDrive(DEVICE_SETTINGS_FILE, 'device-settings.json', pearServerFolderId);
+  } catch (err) {
+    console.error('Błąd zapisu device-settings.json:', err);
+  }
+};
 
 const saveHistory = () => {
   try {
@@ -766,7 +791,8 @@ io.on('connection', (socket) => {
         status: users[socket.id].status,
         customText: users[socket.id].customText,
         sessionToken,
-        accessToken: tokens.access_token
+        accessToken: tokens.access_token,
+        settings: allSeenUsers[payload.name].settings || {}
       });
 
       sendChatBuffer(socket, roomId);
@@ -818,7 +844,8 @@ io.on('connection', (socket) => {
         registeredAt: allSeenUsers[payload.name].registeredAt || Date.now(),
         status: users[socket.id].status,
         customText: users[socket.id].customText,
-        sessionToken: sessionToken
+        sessionToken: sessionToken,
+        settings: allSeenUsers[payload.name].settings || {}
       });
 
       socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
@@ -902,7 +929,8 @@ io.on('connection', (socket) => {
         customText: users[socket.id].customText,
         sessionToken: token,
         accessToken: foundUser.accessToken,
-        voiceRoomId: voiceRoom || null // Informujemy klienta, żeby też wiedział że go tam daliśmy
+        voiceRoomId: voiceRoom || null, // Informujemy klienta, żeby też wiedział że go tam daliśmy
+        settings: foundUser.settings || {}
       });
 
       sendChatBuffer(socket, roomId);
@@ -1108,6 +1136,24 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('update-settings', ({ settings }) => {
+    const user = users[socket.id];
+    if (user && user.username && allSeenUsers[user.username]) {
+      allSeenUsers[user.username].settings = settings;
+      saveUsers();
+      
+      // Powiadom inne połączenia tego samego użytkownika o zmianie ustawień
+      const userSockets = Array.from(io.sockets.sockets.values())
+        .filter(s => s.id !== socket.id && users[s.id]?.username === user.username);
+      
+      userSockets.forEach(s => {
+        s.emit('settings-updated', settings);
+      });
+      
+      console.log(`[SETTINGS] Zaktualizowano i rozesłano ustawienia dla ${user.username}`);
+    }
+  });
+
   socket.on('delete-guild', ({ guildId }) => {
     const user = users[socket.id];
     if (!user || guilds[guildId]?.owner !== user.username) return;
@@ -1248,6 +1294,21 @@ io.on('connection', (socket) => {
 
   socket.on('request-room-state', () => {
     updateAllRoomStates();
+  });
+
+  socket.on('device-settings:get', ({ deviceId }) => {
+    if (!deviceId) return;
+    socket.emit('device-settings:update', deviceSettings[deviceId] || {});
+  });
+
+  socket.on('device-settings:save', ({ deviceId, settings }) => {
+    if (!deviceId || !settings) return;
+    deviceSettings[deviceId] = {
+      ...(deviceSettings[deviceId] || {}),
+      ...settings
+    };
+    saveDeviceSettings();
+    console.log(`[SETTINGS] Zapisano ustawienia dla urządzenia: ${deviceId}`);
   });
 
   socket.on('ping-server', (cb) => {
