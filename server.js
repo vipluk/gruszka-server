@@ -32,6 +32,21 @@ if (GOOGLE_REFRESH_TOKEN) {
 }
 
 const drive = google.drive({ version: 'v3', auth: googleClient });
+
+// --- DIAGNOSTYKA STARTOWA DLA RENDERA ---
+console.log('--- [DEBUG-GOOGLE] Rozpoczynam sprawdzanie kluczy ---');
+console.log('CLIENT_ID:', GOOGLE_CLIENT_ID ? 'DOSTĘPNY' : '❌ BRAK');
+if (GOOGLE_CLIENT_SECRET) {
+  console.log('CLIENT_SECRET: DOSTĘPNY (Długość: ' + GOOGLE_CLIENT_SECRET.length + ')');
+} else {
+  console.log('CLIENT_SECRET: ❌ BRAK! (Google API nie będzie mogło odświeżyć tokena)');
+}
+if (GOOGLE_REFRESH_TOKEN) {
+  console.log('REFRESH_TOKEN: DOSTĘPNY (Długość: ' + GOOGLE_REFRESH_TOKEN.length + ')');
+} else {
+  console.log('REFRESH_TOKEN: ❌ BRAK!');
+}
+console.log('--- [DEBUG-GOOGLE] Koniec sprawdzania ---');
 let pearServerFolderId = null;
 let backupsFolderId = null; // Folder dla rotowanych backupów 24h
 
@@ -98,86 +113,96 @@ const ensureLobby = () => {
 };
 
  // --- LOGIKA SYNCHRONIZACJI Z DRIVE (/pear/server) ---
-async function ensureServerFolder() {
+async function ensureServerFolder(retryCount = 3) {
   if (!GOOGLE_REFRESH_TOKEN) return null;
-  try {
-    // 1. Szukaj folderu 'pear'
-    const qPear = "name='pear' and mimeType='application/vnd.google-apps.folder' and trashed=false";
-    const resPear = await drive.files.list({ q: qPear, fields: 'files(id)' });
-    let pearId = resPear.data.files?.[0]?.id;
+  
+  for (let attempt = 1; attempt <= retryCount; attempt++) {
+    try {
+      // 1. Szukaj folderu 'pear'
+      const qPear = "name='pear' and mimeType='application/vnd.google-apps.folder' and trashed=false";
+      const resPear = await drive.files.list({ q: qPear, fields: 'files(id)' });
+      let pearId = resPear.data.files?.[0]?.id;
 
-    if (!pearId) {
-      const createPear = await drive.files.create({
-        requestBody: { name: 'pear', mimeType: 'application/vnd.google-apps.folder' },
-        fields: 'id'
-      });
-      pearId = createPear.data.id;
+      if (!pearId) {
+        const createPear = await drive.files.create({
+          requestBody: { name: 'pear', mimeType: 'application/vnd.google-apps.folder' },
+          fields: 'id'
+        });
+        pearId = createPear.data.id;
+      }
+
+      // 2. Szukaj folderu 'server' w 'pear'
+      const qSrv = `name='server' and '${pearId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+      const resSrv = await drive.files.list({ q: qSrv, fields: 'files(id)' });
+      let srvId = resSrv.data.files?.[0]?.id;
+
+      if (!srvId) {
+        const createSrv = await drive.files.create({
+          requestBody: { name: 'server', parents: [pearId], mimeType: 'application/vnd.google-apps.folder' },
+          fields: 'id'
+        });
+        srvId = createSrv.data.id;
+      }
+      pearServerFolderId = srvId;
+      console.log("✅ Połączono z folderem Drive: /pear/server (ID:", pearServerFolderId, ")");
+
+      // 3. Szukaj folderu 'backups' w 'server'
+      const qBak = `name='backups' and '${srvId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+      const resBak = await drive.files.list({ q: qBak, fields: 'files(id)' });
+      let bakId = resBak.data.files?.[0]?.id;
+
+      if (!bakId) {
+        const createBak = await drive.files.create({
+          requestBody: { name: 'backups', parents: [srvId], mimeType: 'application/vnd.google-apps.folder' },
+          fields: 'id'
+        });
+        bakId = createBak.data.id;
+      }
+      backupsFolderId = bakId;
+      console.log("📁 Folder backupów gotowy (ID:", backupsFolderId, ")");
+
+      // 4. Szukaj folderu 'friends' w 'pear'
+      const qFnd = `name='friends' and '${pearId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+      const resFnd = await drive.files.list({ q: qFnd, fields: 'files(id)' });
+      let fndId = resFnd.data.files?.[0]?.id;
+
+      if (!fndId) {
+        const createFnd = await drive.files.create({
+          requestBody: { name: 'friends', parents: [pearId], mimeType: 'application/vnd.google-apps.folder' },
+          fields: 'id'
+        });
+        fndId = createFnd.data.id;
+      }
+      pearFriendsFolderId = fndId;
+      console.log("✅ Połączono z folderem Drive: /pear/friends (ID:", pearFriendsFolderId, ")");
+
+      // 5. Szukaj folderu 'backups' w 'friends'
+      const qFBak = `name='backups' and '${fndId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+      const resFBak = await drive.files.list({ q: qFBak, fields: 'files(id)' });
+      let fBakId = resFBak.data.files?.[0]?.id;
+
+      if (!fBakId) {
+        const createFBak = await drive.files.create({
+          requestBody: { name: 'backups', parents: [fndId], mimeType: 'application/vnd.google-apps.folder' },
+          fields: 'id'
+        });
+        fBakId = createFBak.data.id;
+      }
+      friendsBackupsFolderId = fBakId;
+      console.log("📁 Folder backupów DM gotowy (ID:", friendsBackupsFolderId, ")");
+
+      return true;
+    } catch (e) {
+      console.error(`⚠️ [Próba ${attempt}/${retryCount}] Błąd folderów Drive:`, e.message);
+      if (attempt < retryCount) {
+        const delay = attempt * 2000;
+        console.log(`Zasypiam na ${delay}ms przed kolejną próbą...`);
+        await new Promise(res => setTimeout(res, delay));
+      } else {
+        console.error("❌ Osiągnięto limit prób połączenia z Drive API.");
+        return null;
+      }
     }
-
-    // 2. Szukaj folderu 'server' w 'pear'
-    const qSrv = `name='server' and '${pearId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-    const resSrv = await drive.files.list({ q: qSrv, fields: 'files(id)' });
-    let srvId = resSrv.data.files?.[0]?.id;
-
-    if (!srvId) {
-      const createSrv = await drive.files.create({
-        requestBody: { name: 'server', parents: [pearId], mimeType: 'application/vnd.google-apps.folder' },
-        fields: 'id'
-      });
-      srvId = createSrv.data.id;
-    }
-    pearServerFolderId = srvId;
-    console.log("✅ Połączono z folderem Drive: /pear/server (ID:", pearServerFolderId, ")");
-
-    // 3. Szukaj folderu 'backups' w 'server'
-    const qBak = `name='backups' and '${srvId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-    const resBak = await drive.files.list({ q: qBak, fields: 'files(id)' });
-    let bakId = resBak.data.files?.[0]?.id;
-
-    if (!bakId) {
-      const createBak = await drive.files.create({
-        requestBody: { name: 'backups', parents: [srvId], mimeType: 'application/vnd.google-apps.folder' },
-        fields: 'id'
-      });
-      bakId = createBak.data.id;
-    }
-    backupsFolderId = bakId;
-    console.log("📁 Folder backupów gotowy (ID:", backupsFolderId, ")");
-
-    // 4. Szukaj folderu 'friends' w 'pear'
-    const qFnd = `name='friends' and '${pearId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-    const resFnd = await drive.files.list({ q: qFnd, fields: 'files(id)' });
-    let fndId = resFnd.data.files?.[0]?.id;
-
-    if (!fndId) {
-      const createFnd = await drive.files.create({
-        requestBody: { name: 'friends', parents: [pearId], mimeType: 'application/vnd.google-apps.folder' },
-        fields: 'id'
-      });
-      fndId = createFnd.data.id;
-    }
-    pearFriendsFolderId = fndId;
-    console.log("✅ Połączono z folderem Drive: /pear/friends (ID:", pearFriendsFolderId, ")");
-
-    // 5. Szukaj folderu 'backups' w 'friends'
-    const qFBak = `name='backups' and '${fndId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-    const resFBak = await drive.files.list({ q: qFBak, fields: 'files(id)' });
-    let fBakId = resFBak.data.files?.[0]?.id;
-
-    if (!fBakId) {
-      const createFBak = await drive.files.create({
-        requestBody: { name: 'backups', parents: [fndId], mimeType: 'application/vnd.google-apps.folder' },
-        fields: 'id'
-      });
-      fBakId = createFBak.data.id;
-    }
-    friendsBackupsFolderId = fBakId;
-    console.log("📁 Folder backupów DM gotowy (ID:", friendsBackupsFolderId, ")");
-
-    return true;
-  } catch (e) {
-    console.error("❌ Błąd folderów Drive:", e.message);
-    return null;
   }
 }
 
