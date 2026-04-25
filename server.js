@@ -370,7 +370,83 @@ async function initCloud() {
   } finally {
     // Zawsze ładujemy dane (chociażby lokalne), aby serwer nie był pusty
     loadAllData();
-    
+
+    // --- JEDNORAZOWA MIGRACJA KARTY VIPLUKA ---
+    const OLD_NAME = 'vipluk VL';
+    const NEW_NAME = 'vipluk';
+    let needsCloudSync = false;
+
+    if (allSeenUsers[NEW_NAME] && allSeenUsers[OLD_NAME]) {
+        console.log(`[MIGRATE] Znaleziono kolizję użytkownika '${NEW_NAME}'. Puste konto zostanie nadpisane zmigrowanym.`);
+        allSeenUsers[OLD_NAME].sessionToken = allSeenUsers[NEW_NAME].sessionToken;
+        allSeenUsers[OLD_NAME].accessToken = allSeenUsers[NEW_NAME].accessToken;
+        allSeenUsers[OLD_NAME].refreshToken = allSeenUsers[NEW_NAME].refreshToken || allSeenUsers[OLD_NAME].refreshToken;
+        delete allSeenUsers[NEW_NAME];
+    }
+
+    if (allSeenUsers[OLD_NAME]) {
+      const userData = allSeenUsers[OLD_NAME];
+      userData.username = NEW_NAME;
+      userData.nickname = NEW_NAME;
+      allSeenUsers[NEW_NAME] = userData;
+      delete allSeenUsers[OLD_NAME];
+      console.log(`[MIGRATE] Zmigrowano użytkownika ${OLD_NAME} -> ${NEW_NAME}`);
+      needsCloudSync = true;
+    }
+
+    for (const guildId in guilds) {
+      const guild = guilds[guildId];
+      if (guild.owner === OLD_NAME) { guild.owner = NEW_NAME; needsCloudSync = true; }
+      if (guild.members && guild.members.includes(OLD_NAME)) {
+        guild.members = guild.members.map(m => m === OLD_NAME ? NEW_NAME : m);
+        guild.members = [...new Set(guild.members)];
+        needsCloudSync = true;
+      }
+      if (guild.memberMetadata && guild.memberMetadata[OLD_NAME]) {
+        guild.memberMetadata[NEW_NAME] = guild.memberMetadata[OLD_NAME];
+        delete guild.memberMetadata[OLD_NAME];
+        needsCloudSync = true;
+      }
+    }
+
+    for (const userId in friendsData) {
+      const profile = friendsData[userId];
+      if (profile.friends && profile.friends.includes(OLD_NAME)) {
+        profile.friends = profile.friends.map(f => f === OLD_NAME ? NEW_NAME : f);
+        profile.friends = [...new Set(profile.friends)];
+        needsCloudSync = true;
+      }
+      if (profile.friendRequests && profile.friendRequests.includes(OLD_NAME)) {
+        profile.friendRequests = profile.friendRequests.map(r => r === OLD_NAME ? NEW_NAME : r);
+        profile.friendRequests = [...new Set(profile.friendRequests)];
+        needsCloudSync = true;
+      }
+    }
+    if (friendsData[OLD_NAME]) {
+      friendsData[NEW_NAME] = friendsData[OLD_NAME];
+      delete friendsData[OLD_NAME];
+      needsCloudSync = true;
+    }
+
+    let msgChanged = false;
+    for (const msg of messageBuffer) {
+      if (msg.author === OLD_NAME) { msg.author = NEW_NAME; msgChanged = true; needsCloudSync = true; }
+    }
+    let dmChanged = false;
+    for (const msg of dmMessageBuffer) {
+      if (msg.author === OLD_NAME) { msg.author = NEW_NAME; dmChanged = true; needsCloudSync = true; }
+    }
+
+    if (needsCloudSync) {
+      console.log(`[MIGRATE] Zapisywanie zmigrowanych danych i wysyłanie do chmury Drive...`);
+      saveUsers();
+      saveGuilds();
+      saveFriends();
+      if (msgChanged) saveHistory();
+      if (dmChanged) saveDmHistory();
+    }
+    // --- KONIEC MIGRACJI ---
+
     // Zaplanuj backupy 24h
     setInterval(runCloudBackup, 24 * 60 * 60 * 1000);
     // Wykonaj pierwszy backup po 10 sekundach od startu (po pobraniu z chmury)
@@ -783,14 +859,28 @@ io.on('connection', (socket) => {
       });
       const payload = ticket.getPayload();
       const sessionToken = crypto.randomUUID();
+      const googleId = payload.sub; // Stałe, niezmienne ID z Google
 
-      let existing = allSeenUsers[payload.name];
-      allSeenUsers[payload.name] = {
-        username: payload.name,
+      // Znajdź użytkownika po googleId lub (legacy) po nazwie
+      let internalUsername = payload.name;
+      const existingByGoogleId = Object.values(allSeenUsers).find(u => u.googleId === googleId);
+      
+      if (existingByGoogleId) {
+        internalUsername = existingByGoogleId.username;
+        console.log(`[AUTH] Użytkownik powrócił! Znaleziono po googleId. Wewnętrzne ID: ${internalUsername}, Nowa nazwa w Google: ${payload.name}`);
+      } else if (allSeenUsers[payload.name]) {
+        // Fallback dla starych kont przed dodaniem googleId
+        internalUsername = payload.name;
+      }
+
+      let existing = allSeenUsers[internalUsername];
+      allSeenUsers[internalUsername] = {
+        username: internalUsername, // stałe ID
+        googleId: googleId, // Zapisujemy na przyszłość
         avatar: payload.picture,
         status: status || (existing ? existing.status : 'online'),
         customText: customText || (existing ? existing.customText : ''),
-        nickname: (existing && existing.nickname) ? existing.nickname : payload.name,
+        nickname: payload.name, // Aktualizujemy wyświetlaną nazwę do obecnej z Google!
         registeredAt: (existing && existing.registeredAt) ? existing.registeredAt : Date.now(),
         lastSeen: Date.now(),
         sessionToken,
@@ -799,25 +889,25 @@ io.on('connection', (socket) => {
       };
       saveUsers();
 
-      users[socket.id].username = payload.name;
+      users[socket.id].username = internalUsername;
       users[socket.id].avatar = payload.picture;
-      users[socket.id].status = allSeenUsers[payload.name].status;
-      users[socket.id].customText = allSeenUsers[payload.name].customText;
+      users[socket.id].status = allSeenUsers[internalUsername].status;
+      users[socket.id].customText = allSeenUsers[internalUsername].customText;
 
       socket.join(roomId || "Ogólny");
       users[socket.id].rooms.add(roomId || "Ogólny");
 
-      console.log(`[AUTH] Emituję login-success dla ${payload.name}: Nick=${allSeenUsers[payload.name].nickname}, RegAt=${allSeenUsers[payload.name].registeredAt}`);
+      console.log(`[AUTH] Emituję login-success dla ${internalUsername}: Nick=${allSeenUsers[internalUsername].nickname}`);
       socket.emit('login-success', {
-        username: payload.name,
+        username: internalUsername,
         avatar: payload.picture,
-        nickname: allSeenUsers[payload.name].nickname || payload.name,
-        registeredAt: allSeenUsers[payload.name].registeredAt || Date.now(),
+        nickname: allSeenUsers[internalUsername].nickname || internalUsername,
+        registeredAt: allSeenUsers[internalUsername].registeredAt || Date.now(),
         status: users[socket.id].status,
         customText: users[socket.id].customText,
         sessionToken,
         accessToken: tokens.access_token,
-        settings: allSeenUsers[payload.name].settings || {}
+        settings: allSeenUsers[internalUsername].settings || {}
       });
 
       sendChatBuffer(socket, roomId);
@@ -837,40 +927,55 @@ io.on('connection', (socket) => {
         audience: GOOGLE_CLIENT_ID,
       });
       const payload = ticket.getPayload();
-      console.log(`[LOGIN] Sukces: ${payload.name} (${payload.email})`);
+      const googleId = payload.sub; // Stałe, niezmienne ID z Google
+      console.log(`[LOGIN] Sukces: ${payload.name} (${payload.email}) [googleId: ${googleId}]`);
 
-      users[socket.id].username = payload.name;
+      // Znajdź użytkownika po googleId lub (legacy) po nazwie
+      let internalUsername = payload.name;
+      const existingByGoogleId = Object.values(allSeenUsers).find(u => u.googleId === googleId);
+      
+      if (existingByGoogleId) {
+        internalUsername = existingByGoogleId.username;
+        console.log(`[LOGIN] Użytkownik powrócił! Wewnętrzne ID: ${internalUsername}, Nowa nazwa: ${payload.name}`);
+      } else if (allSeenUsers[payload.name]) {
+        internalUsername = payload.name;
+      }
+
+      users[socket.id].username = internalUsername;
       users[socket.id].avatar = payload.picture;
       users[socket.id].status = status || 'online';
       if (customText) users[socket.id].customText = customText.substring(0, 32);
 
       const sessionToken = crypto.randomUUID();
-      let existing = allSeenUsers[payload.name];
-      allSeenUsers[payload.name] = {
-        username: payload.name,
+      let existing = allSeenUsers[internalUsername];
+      allSeenUsers[internalUsername] = {
+        username: internalUsername,
+        googleId: googleId, // Zapisujemy na przyszłość
         avatar: payload.picture,
-        nickname: existing && existing.nickname ? existing.nickname : payload.name,
+        nickname: payload.name, // Aktualizujemy wyświetlaną nazwę
         registeredAt: existing && existing.registeredAt ? existing.registeredAt : Date.now(),
         status: status || (existing ? existing.status : 'online'),
         customText: customText || (existing ? existing.customText : ''),
         lastSeen: Date.now(),
-        sessionToken: sessionToken
+        sessionToken: sessionToken,
+        accessToken: existing ? existing.accessToken : undefined,
+        refreshToken: existing ? existing.refreshToken : undefined
       };
       saveUsers();
 
       socket.join(roomId);
       users[socket.id].rooms.add(roomId);
 
-      console.log(`[LOGIN] Emituję login-success dla ${payload.name}: Nick=${allSeenUsers[payload.name].nickname}, RegAt=${allSeenUsers[payload.name].registeredAt}`);
+      console.log(`[LOGIN] Emituję login-success dla ${internalUsername}: Nick=${allSeenUsers[internalUsername].nickname}`);
       socket.emit('login-success', {
-        username: payload.name,
+        username: internalUsername,
         avatar: payload.picture,
-        nickname: allSeenUsers[payload.name].nickname || payload.name,
-        registeredAt: allSeenUsers[payload.name].registeredAt || Date.now(),
+        nickname: allSeenUsers[internalUsername].nickname || internalUsername,
+        registeredAt: allSeenUsers[internalUsername].registeredAt || Date.now(),
         status: users[socket.id].status,
         customText: users[socket.id].customText,
         sessionToken: sessionToken,
-        settings: allSeenUsers[payload.name].settings || {}
+        settings: allSeenUsers[internalUsername].settings || {}
       });
 
       socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
