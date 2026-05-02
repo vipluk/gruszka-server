@@ -26,6 +26,44 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "69113746688-m3bm8hlckp
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 
+// --- SZYFROWANIE TOKENÓW UŻYTKOWNIKÓW ---
+const SERVER_SECRET_KEY = process.env.SERVER_SECRET_KEY || 'pear-default-secret-key-change-it-in-production';
+const ENCRYPTION_KEY = crypto.createHash('sha256').update(SERVER_SECRET_KEY).digest();
+const IV_LENGTH = 16;
+
+function encryptToken(text) {
+  if (!text) return text;
+  // Jeśli już jest zaszyfrowane (ma dwukropek po 32 znakach hex IV), nie szyfruj podwójnie
+  if (text.length > 33 && text.charAt(32) === ':') return text;
+  try {
+    let iv = crypto.randomBytes(IV_LENGTH);
+    let cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let encrypted = cipher.update(text);
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+    return iv.toString('hex') + ':' + encrypted.toString('hex');
+  } catch (e) {
+    console.error("Encryption error:", e.message);
+    return null;
+  }
+}
+
+function decryptToken(text) {
+  if (!text) return text;
+  if (text.indexOf(':') === -1) return text; // Zgodność wsteczna z nieszyfrowanymi tokenami
+  try {
+    let textParts = text.split(':');
+    let iv = Buffer.from(textParts.shift(), 'hex');
+    let encryptedText = Buffer.from(textParts.join(':'), 'hex');
+    let decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let decrypted = decipher.update(encryptedText);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return decrypted.toString();
+  } catch (e) {
+    console.error("Decryption error:", e.message);
+    return null; // Zwracamy null gdy odszyfrowanie się nie powiedzie
+  }
+}
+
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
 if (GOOGLE_REFRESH_TOKEN) {
   googleClient.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
@@ -111,6 +149,41 @@ const ensureLobby = () => {
     saveGuilds();
   }
 };
+
+async function ensureTargetFolder(driveClient, type, subName) {
+  try {
+    const qRoot = "name='pear_cloud' and mimeType='application/vnd.google-apps.folder' and trashed=false";
+    let rootRes = await driveClient.files.list({ q: qRoot, fields: 'files(id)' });
+    let rootId = rootRes.data.files?.[0]?.id;
+    if (!rootId) {
+      const cRoot = await driveClient.files.create({ requestBody: { name: 'pear_cloud', mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
+      rootId = cRoot.data.id;
+    }
+
+    const qFiles = `name='files' and '${rootId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    let filesRes = await driveClient.files.list({ q: qFiles, fields: 'files(id)' });
+    let filesId = filesRes.data.files?.[0]?.id;
+    if (!filesId) {
+      const cFiles = await driveClient.files.create({ requestBody: { name: 'files', parents: [rootId], mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
+      filesId = cFiles.data.id;
+    }
+
+    if (type === 'main') return filesId;
+
+    const targetName = type === 'friend' ? `friend_${subName}` : `guild_${subName}`;
+    const qSub = `name='${targetName}' and '${filesId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    let subRes = await driveClient.files.list({ q: qSub, fields: 'files(id)' });
+    let subId = subRes.data.files?.[0]?.id;
+    if (!subId) {
+      const cSub = await driveClient.files.create({ requestBody: { name: targetName, parents: [filesId], mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
+      subId = cSub.data.id;
+    }
+    return subId;
+  } catch (e) {
+    console.error("Błąd tworzenia struktury chmury:", e.message);
+    return null;
+  }
+}
 
  // --- LOGIKA SYNCHRONIZACJI Z DRIVE (/pear/server) ---
 async function ensureServerFolder(retryCount = 3) {
@@ -697,9 +770,9 @@ const updateAllRoomStates = () => {
       broadcastUsers[username] = {
         ...allSeenUsers[username],
         status: allSeenUsers[username].status === 'offline' ? 'online' : allSeenUsers[username].status,
-        nickname: allSeenUsers[username].nickname || username,
-        registeredAt: allSeenUsers[username].registeredAt,
-        lastSeen: Date.now()
+        customText: allSeenUsers[username].customText,
+        registeredAt: allSeenUsers[username].registeredAt || Date.now(),
+        cloudConfig: allSeenUsers[username].cloudConfig || { sharedWith: {}, sharedGuilds: {} }
       };
       if (!onlineUsernames.includes(username)) onlineUsernames.push(username);
     }
@@ -717,7 +790,8 @@ const updateAllRoomStates = () => {
         customText: u.customText || '',
         nickname: allSeenUsers[u.username]?.nickname || u.username,
         registeredAt: allSeenUsers[u.username]?.registeredAt,
-        lastSeen: Date.now()
+        lastSeen: Date.now(),
+        cloudConfig: allSeenUsers[u.username]?.cloudConfig || { sharedWith: {}, sharedGuilds: {} }
       };
       if (!onlineUsernames.includes(u.username)) onlineUsernames.push(u.username);
     }
@@ -873,18 +947,19 @@ io.on('connection', (socket) => {
         internalUsername = payload.name;
       }
 
-      let existing = allSeenUsers[internalUsername];
+      let existing = allSeenUsers[internalUsername] || {};
       allSeenUsers[internalUsername] = {
+        ...existing,
         username: internalUsername, // stałe ID
         googleId: googleId, // Zapisujemy na przyszłość
         avatar: payload.picture,
-        status: status || (existing ? existing.status : 'online'),
-        customText: customText || (existing ? existing.customText : ''),
+        status: status || existing.status || 'online',
+        customText: customText !== undefined ? customText : (existing.customText || ''),
         nickname: payload.name, // Aktualizujemy wyświetlaną nazwę do obecnej z Google!
-        registeredAt: (existing && existing.registeredAt) ? existing.registeredAt : Date.now(),
+        registeredAt: existing.registeredAt || Date.now(),
         lastSeen: Date.now(),
         sessionToken,
-        refreshToken: tokens.refresh_token || (existing ? existing.refreshToken : null),
+        refreshToken: tokens.refresh_token ? encryptToken(tokens.refresh_token) : (existing.refreshToken || null),
         accessToken: tokens.access_token
       };
       saveUsers();
@@ -907,7 +982,8 @@ io.on('connection', (socket) => {
         customText: users[socket.id].customText,
         sessionToken,
         accessToken: tokens.access_token,
-        settings: allSeenUsers[internalUsername].settings || {}
+        settings: allSeenUsers[internalUsername].settings || {},
+        cloudConfig: allSeenUsers[internalUsername].cloudConfig || { sharedWith: {}, sharedGuilds: {} }
       });
 
       sendChatBuffer(socket, roomId);
@@ -947,19 +1023,20 @@ io.on('connection', (socket) => {
       if (customText) users[socket.id].customText = customText.substring(0, 32);
 
       const sessionToken = crypto.randomUUID();
-      let existing = allSeenUsers[internalUsername];
+      let existing = allSeenUsers[internalUsername] || {};
       allSeenUsers[internalUsername] = {
+        ...existing,
         username: internalUsername,
         googleId: googleId, // Zapisujemy na przyszłość
         avatar: payload.picture,
         nickname: payload.name, // Aktualizujemy wyświetlaną nazwę
-        registeredAt: existing && existing.registeredAt ? existing.registeredAt : Date.now(),
-        status: status || (existing ? existing.status : 'online'),
-        customText: customText || (existing ? existing.customText : ''),
+        registeredAt: existing.registeredAt || Date.now(),
+        status: status || existing.status || 'online',
+        customText: customText !== undefined ? customText : (existing.customText || ''),
         lastSeen: Date.now(),
         sessionToken: sessionToken,
-        accessToken: existing ? existing.accessToken : undefined,
-        refreshToken: existing ? existing.refreshToken : undefined
+        accessToken: existing.accessToken || undefined,
+        refreshToken: existing.refreshToken || undefined
       };
       saveUsers();
 
@@ -975,7 +1052,8 @@ io.on('connection', (socket) => {
         status: users[socket.id].status,
         customText: users[socket.id].customText,
         sessionToken: sessionToken,
-        settings: allSeenUsers[internalUsername].settings || {}
+        settings: allSeenUsers[internalUsername].settings || {},
+        cloudConfig: allSeenUsers[internalUsername].cloudConfig || { sharedWith: {}, sharedGuilds: {} }
       });
 
       socket.emit('chat-buffer', messageBuffer.filter(m => m.channel === roomId));
@@ -1059,8 +1137,9 @@ io.on('connection', (socket) => {
         customText: users[socket.id].customText,
         sessionToken: token,
         accessToken: foundUser.accessToken,
-        voiceRoomId: voiceRoom || null, // Informujemy klienta, żeby też wiedział że go tam daliśmy
-        settings: foundUser.settings || {}
+        voiceRoomId: voiceRoom || null,
+        settings: foundUser.settings || {},
+        cloudConfig: foundUser.cloudConfig || { sharedWith: {}, sharedGuilds: {} }
       });
 
       sendChatBuffer(socket, roomId);
@@ -1088,7 +1167,9 @@ io.on('connection', (socket) => {
     try {
       console.log(`[DRIVE] Odświeżanie tokenu dla ${user.username}...`);
       const client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-      client.setCredentials({ refresh_token: profile.refreshToken });
+      const decToken = decryptToken(profile.refreshToken);
+      if (!decToken) throw new Error("Błąd deszyfrowania tokenu");
+      client.setCredentials({ refresh_token: decToken });
       const { credentials } = await client.refreshAccessToken();
       
       profile.accessToken = credentials.access_token;
@@ -1448,6 +1529,96 @@ io.on('connection', (socket) => {
   socket.on('explicit-logout', () => {
     const user = users[socket.id];
     if (user) user.explicitlyLoggedOut = true;
+  });
+
+  // --- OBSŁUGA CHMURY (SOFT QUOTA & UPLOAD) ---
+  socket.on('update-cloud-config', ({ cloudConfig }) => {
+    const user = users[socket.id];
+    if (user && user.username && allSeenUsers[user.username]) {
+      allSeenUsers[user.username].cloudConfig = cloudConfig;
+      saveUsers();
+    }
+  });
+
+  socket.on('request-upload-url', async ({ targetCloud, fileMetadata }, callback) => {
+    const user = users[socket.id];
+    if (!user || !user.username) return callback({ error: "Brak autoryzacji" });
+    const uploaderUsername = user.username;
+    
+    let ownerUsername = uploaderUsername;
+    let targetFolderType = 'main';
+    let subfolderName = null;
+
+    if (targetCloud.type === 'personal') {
+      ownerUsername = targetCloud.id; // nazwa użytkownika, do którego wgrywamy
+      const config = allSeenUsers[ownerUsername]?.cloudConfig?.sharedWith?.[uploaderUsername];
+      if (!config || config.enabled === false) return callback({ error: "Brak udostępnionej chmury" });
+      if (config.usedBytes + fileMetadata.size > config.quotaBytes) return callback({ error: "Przekroczono limit GB w chmurze znajomego" });
+      targetFolderType = 'friend';
+      subfolderName = allSeenUsers[uploaderUsername]?.googleId || uploaderUsername; 
+    } else if (targetCloud.type === 'guild') {
+      const guild = guilds[targetCloud.id];
+      if (!guild) return callback({ error: "Gildia nie istnieje" });
+      ownerUsername = guild.owner;
+      const config = allSeenUsers[ownerUsername]?.cloudConfig?.sharedGuilds?.[targetCloud.id];
+      if (!config || config.enabled === false) return callback({ error: "Brak udostępnionej chmury dla gildii" });
+      if (config.usedBytes + fileMetadata.size > config.quotaBytes) return callback({ error: "Przekroczono limit GB w chmurze gildii" });
+      targetFolderType = 'guild';
+      subfolderName = targetCloud.id;
+    }
+
+    const profile = allSeenUsers[ownerUsername];
+    if (!profile || !profile.refreshToken) return callback({ error: "Właściciel chmury nie ma podpiętego Dysku Google" });
+
+    try {
+      const decToken = decryptToken(profile.refreshToken);
+      if (!decToken) return callback({ error: "Błąd odszyfrowania tokenu" });
+      
+      const client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+      client.setCredentials({ refresh_token: decToken });
+      const targetDrive = google.drive({ version: 'v3', auth: client });
+
+      // 1. Struktura folderów
+      let folderId = await ensureTargetFolder(targetDrive, targetFolderType, subfolderName);
+      if (!folderId) return callback({ error: "Nie udało się utworzyć struktury folderów" });
+
+      // 2. Pobranie linku resumable
+      const tokenRes = await client.getAccessToken();
+      const accessToken = tokenRes.token;
+
+      const origin = socket.handshake.headers.origin || "http://localhost:1420";
+
+      const uploadInitRes = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'X-Upload-Content-Type': fileMetadata.mimeType || 'application/octet-stream',
+          'X-Upload-Content-Length': fileMetadata.size.toString(),
+          'Origin': origin
+        },
+        body: JSON.stringify({
+          name: fileMetadata.name,
+          parents: [folderId]
+        })
+      });
+
+      if (!uploadInitRes.ok) throw new Error("Google Drive API Error: " + await uploadInitRes.text());
+      const uploadUrl = uploadInitRes.headers.get('Location');
+      
+      // 3. Aktualizacja "Soft Quota"
+      if (targetCloud.type === 'personal') {
+         allSeenUsers[ownerUsername].cloudConfig.sharedWith[uploaderUsername].usedBytes += fileMetadata.size;
+      } else if (targetCloud.type === 'guild') {
+         allSeenUsers[ownerUsername].cloudConfig.sharedGuilds[targetCloud.id].usedBytes += fileMetadata.size;
+      }
+      saveUsers();
+
+      callback({ uploadUrl, targetFolderId: folderId, ownerAccessToken: accessToken });
+    } catch (e) {
+      console.error("[CLOUD UPLOAD] Błąd przygotowania linku:", e);
+      callback({ error: "Nie udało się przygotować sesji wysyłania do chmury." });
+    }
   });
 
   socket.on('disconnect', () => {
