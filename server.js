@@ -1639,13 +1639,16 @@ io.on('connection', (socket) => {
 
       const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
       oauth2Client.setCredentials({ refresh_token: decToken });
-      const tokenRes = await oauth2Client.getAccessToken();
-
-      await fetch(`https://www.googleapis.com/drive/v3/files/${payload.fileId}/permissions`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${tokenRes.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: 'reader', type: 'anyone' })
+      
+      const driveInstance = google.drive({ version: 'v3', auth: oauth2Client });
+      await driveInstance.permissions.create({
+        fileId: payload.fileId,
+        requestBody: {
+          role: 'reader',
+          type: 'anyone'
+        }
       });
+      console.log(`[DRIVE] Nadano uprawnienia publiczne dla pliku ${payload.fileId} (właściciel: ${ownerUsername})`);
       
       if (callback) callback({ success: true });
     } catch(e) {
