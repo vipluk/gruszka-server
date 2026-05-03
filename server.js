@@ -1632,14 +1632,13 @@ io.on('connection', (socket) => {
       if (!ownerUsername) return callback && callback({ error: "Nie znaleziono właściciela." });
 
       let user = allSeenUsers[ownerUsername];
-      if (!user || !user.cloudConfig) return callback && callback({ error: "Brak konfiguracji chmury." });
+      if (!user || !user.refreshToken) return callback && callback({ error: "Brak konfiguracji chmury." });
 
-      const oauth2Client = new google.auth.OAuth2(
-        process.env.GOOGLE_CLIENT_ID,
-        process.env.GOOGLE_CLIENT_SECRET,
-        "http://localhost:1420"
-      );
-      oauth2Client.setCredentials({ refresh_token: user.cloudConfig.refreshToken });
+      const decToken = decryptToken(user.refreshToken);
+      if (!decToken) return callback && callback({ error: "Błąd odszyfrowania tokenu" });
+
+      const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+      oauth2Client.setCredentials({ refresh_token: decToken });
       const tokenRes = await oauth2Client.getAccessToken();
 
       await fetch(`https://www.googleapis.com/drive/v3/files/${payload.fileId}/permissions`, {
