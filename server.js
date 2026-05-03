@@ -1621,6 +1621,40 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('make-file-public', async (payload, callback) => {
+    try {
+      const targetCloud = payload.targetCloud;
+      let ownerUsername = targetCloud.id;
+
+      if (targetCloud.type === 'guild') {
+        ownerUsername = guilds[targetCloud.id]?.owner;
+      }
+      if (!ownerUsername) return callback && callback({ error: "Nie znaleziono właściciela." });
+
+      let user = allSeenUsers[ownerUsername];
+      if (!user || !user.cloudConfig) return callback && callback({ error: "Brak konfiguracji chmury." });
+
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        "http://localhost:1420"
+      );
+      oauth2Client.setCredentials({ refresh_token: user.cloudConfig.refreshToken });
+      const tokenRes = await oauth2Client.getAccessToken();
+
+      await fetch(`https://www.googleapis.com/drive/v3/files/${payload.fileId}/permissions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tokenRes.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'reader', type: 'anyone' })
+      });
+      
+      if (callback) callback({ success: true });
+    } catch(e) {
+      console.error("Błąd ustawiania uprawnień na serwerze:", e);
+      if (callback) callback({ error: "Błąd serwera" });
+    }
+  });
+
   socket.on('disconnect', () => {
     for (const hash in fileOwners) {
       if (fileOwners[hash]) fileOwners[hash].delete(socket.id);
